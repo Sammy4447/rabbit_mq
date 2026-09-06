@@ -63,9 +63,9 @@ Node.js app  ──(AMQP over TCP, port 5672)──►  RabbitMQ server
    (amqplib)                                  (our docker container)
 ```
 
-AMQP defines standard concepts everyone agrees on: connections, channels,
-exchanges, queues, bindings, and message acknowledgements. That's exactly
-what the rest of this document walks through.
+AMQP defines standard concepts everyone agrees on: producers, queues,
+consumers, and message acknowledgements. That's exactly what the rest of
+this document walks through.
 
 ---
 
@@ -91,139 +91,7 @@ is ready to take them — that's the "buffering" benefit from section 1.
 
 ---
 
-## 5. Connection & Channel
-
-These are two different levels of "being connected" to RabbitMQ.
-
-- **Connection**: a real TCP socket between your app and the RabbitMQ
-  server. Expensive to create/destroy, so you normally open just **one**
-  per app.
-- **Channel**: a lightweight "virtual connection" that lives *inside* a
-  connection. All the real work (publishing, consuming, declaring queues)
-  happens on a channel, not directly on the connection.
-
-```
-┌─────────────────────────── Connection (TCP) ───────────────────────────┐
-│                                                                         │
-│   ┌───────────┐        ┌───────────┐        ┌───────────┐              │
-│   │ Channel 1 │        │ Channel 2 │        │ Channel 3 │   ...        │
-│   └───────────┘        └───────────┘        └───────────┘              │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-Why bother with channels instead of just using the connection directly?
-Opening a new TCP connection is costly, but opening a new channel is
-cheap — so an app with many concurrent tasks can multiplex them over a
-handful of channels instead of many connections.
-
-In our code:
-```js
-const connection = await amqp.connect(RABBITMQ_URL); // one TCP connection
-const channel = await connection.createChannel();    // one channel on it
-```
-
----
-
-## 6. Exchanges & Types
-
-Here's the part that's easy to miss when you're just doing
-`sendToQueue()`: **a producer never actually sends directly to a queue.**
-It sends to an **exchange**, and the exchange decides which queue(s) the
-message ends up in.
-
-```
-                         ┌───────────┐
-Producer ───publish───► │ Exchange  │ ───routes to───► Queue(s) ───► Consumer
-                         └───────────┘
-```
-
-`channel.sendToQueue(QUEUE, ...)` (used in this project) is actually a
-convenience shortcut that publishes to RabbitMQ's built-in **default
-exchange** (an empty-string-named, unnamed exchange) using the queue name
-as the routing key. Under the hood it's still "publish to an exchange."
-
-There are 4 standard exchange types, each with different routing logic:
-
-### a) Direct
-Routes a message to the queue(s) whose **binding key** exactly matches the
-message's **routing key**.
-```
-                     routing key = "error"
-Producer ──publish──────────────────────► [ Direct Exchange ]
-                                              │            │
-                                     binding: "error"  binding: "info"
-                                              │            │
-                                              ▼            ▼
-                                        [ Queue A ]   [ Queue B ]
-                                        (gets it)     (doesn't)
-```
-
-### b) Fanout
-Ignores routing keys completely — broadcasts every message to **all**
-bound queues. Used for pub/sub-style broadcast.
-```
-Producer ──publish──► [ Fanout Exchange ]
-                          │      │      │
-                          ▼      ▼      ▼
-                      Queue A  Queue B  Queue C
-                      (all get a copy)
-```
-
-### c) Topic
-Like Direct, but routing/binding keys support wildcard patterns
-(`*` = one word, `#` = zero or more words). E.g. a binding of
-`"logs.*.error"` matches routing key `"logs.app.error"`.
-```
-routing key: "logs.payment.error"
-                     │
-                     ▼
-             [ Topic Exchange ]
-              /              \
-   binding: "logs.*.error"   binding: "logs.payment.#"
-              │                          │
-              ▼                          ▼
-          Queue A (match)            Queue B (match)
-```
-
-### d) Headers
-Routes based on message header attributes instead of the routing key at
-all (rarely used in practice) — not covered further here.
-
-**In this project** we only use the default exchange with `sendToQueue`,
-which is the simplest possible case: one producer, one queue, one
-consumer — no fancy routing needed. Exchanges matter once you have
-multiple queues/consumers that should each get different messages.
-
----
-
-## 7. Binding & Routing Key
-
-- **Routing key**: a label the *producer* attaches to a message when
-  publishing (e.g. `"error"`, `"logs.payment.error"`).
-- **Binding**: a *link* you create between an exchange and a queue, with a
-  binding key that says "send me messages whose routing key matches this."
-
-```
-Queue.bind(exchange, bindingKey)
-        │
-        ▼
-[ Exchange ] ──message with routing key "X"──► matches binding "X"? ──► goes into Queue
-```
-
-Analogy: think of routing key as the **address written on an envelope**,
-and binding as **telling the post office "any mail addressed like this
-should go to my mailbox."** The exchange is the sorting machine that reads
-the address and applies your rule.
-
-With the default exchange + `sendToQueue(queueName, ...)`, RabbitMQ
-auto-creates an implicit binding where the binding key = the queue name,
-so every queue is automatically reachable by its own name. That's why we
-don't have to manually declare exchanges/bindings in this simple example.
-
----
-
-## 8. Message Acknowledgement (ack)
+## 5. Message Acknowledgement (ack)
 
 When a consumer receives a message, RabbitMQ needs to know: *"did you
 actually finish processing this, or should I give it to someone else?"*
@@ -266,19 +134,16 @@ lost just because a consumer happened to crash mid-processing.
 ## Putting it all together
 
 ```
-┌──────────┐                 ┌───────────────────────────────┐              ┌──────────┐
-│ Producer │                 │           RabbitMQ            │              │ Consumer │
-│          │   connection    │  ┌──────────┐                 │  connection  │          │
-│  (AMQP   │◄───────────────►│  │ Exchange │──binding/routing│◄────────────►│  (AMQP   │
-│  client) │   + channel     │  └────┬─────┘   key───────┐   │  + channel   │  client) │
-└──────────┘                 │       │                   │   │              └──────────┘
-     │                       │       ▼                   ▼   │                   │
-     │  sendToQueue("hello",  │  ┌─────────────┐               │   consume("hello") │
-     └──publish message)────►│  │ Queue: hello │──────────────►│───ack(msg)────────┘
-                              │  └─────────────┘               │
-                              └───────────────────────────────┘
+┌──────────┐                    ┌────────────────────┐                    ┌──────────┐
+│ Producer │  sendToQueue       │       RabbitMQ      │      consume       │ Consumer │
+│  (AMQP   │───("hello",───────►│  ┌───────────────┐  │───────────────────►│  (AMQP   │
+│  client) │    message)        │  │ Queue: "hello"│  │                    │  client) │
+└──────────┘                    │  └───────────────┘  │                    └──────────┘
+                                 └────────────────────┘                          │
+                                          ▲                                      │
+                                          └──────────────ack(msg)────────────────┘
 ```
 
-That's the full round trip this project demonstrates: producer publishes →
-default exchange routes it into the `hello` queue → consumer receives it →
-consumer acknowledges it.
+That's the full round trip this project demonstrates: producer publishes a
+message into the `hello` queue → consumer receives it → consumer
+acknowledges it, so RabbitMQ knows it's safe to remove from the queue.
