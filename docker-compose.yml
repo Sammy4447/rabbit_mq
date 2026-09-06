@@ -1,0 +1,49 @@
+services:
+  # The RabbitMQ broker itself. Using the "management" image variant so we
+  # also get the web-based admin UI, not just the raw message broker.
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # AMQP port — this is what producer/consumer actually connect to
+      - "15672:15672" # Management UI (open http://localhost:15672, login guest/guest)
+    # Docker's own way of knowing "is RabbitMQ actually ready to accept connections yet?"
+    # Other services use this (via depends_on: condition: service_healthy) to wait
+    # for RabbitMQ instead of racing to connect before it's up.
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # The producer: builds from ./producer/Dockerfile, lets you type messages
+  # and send them to the "hello" queue.
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy # don't start until RabbitMQ's healthcheck passes
+    environment:
+      # amqplib inside the container connects using the service name "rabbitmq"
+      # (Docker's internal DNS), not localhost
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    stdin_open: true # keep STDIN open so we can type interactively (like `docker run -i`)
+    tty: true        # allocate a pseudo-terminal so the prompt renders properly (like `-t`)
+    profiles: ["tools"] # excludes this from plain `docker compose up`; start it manually
+                         # in its own terminal with `docker compose run --rm producer`
+
+  # The consumer: builds from ./consumer/Dockerfile, listens on the "hello"
+  # queue and prints every message it receives.
+  consumer:
+    build: ./consumer
+    container_name: consumer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy # don't start until RabbitMQ's healthcheck passes
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+    stdin_open: true
+    tty: true
+    profiles: ["tools"] # excludes this from plain `docker compose up`; start it manually
+                         # in its own terminal with `docker compose run --rm consumer`
